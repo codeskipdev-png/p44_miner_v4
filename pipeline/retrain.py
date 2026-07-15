@@ -36,7 +36,7 @@ from .features import chunk_features, feature_names, rows_to_matrix
 from .fetch_benchmark import sync
 from .model import RankBlend
 from .serving_blend import ServingBlend
-from .threshold import fit_deploy_threshold, shape_hybrid
+from .threshold import shape_gate_safe
 from .train import (
     MAX_KS,
     featurize_dates,
@@ -55,7 +55,7 @@ HOLDOUT_DAYS = 2  # newest N dates are the gate set
 GATE_SEEDS = (42, 7, 123)  # average the live-size gate over these pooling seeds
 MAX_REGRESSION = 0.02
 TARGET_FPR = 0.04
-MAX_POS_FRAC = 0.16
+MAX_POS_FRAC = 0.20
 RETRAIN_UTC_HOUR = 3.5  # 03:30 UTC, after the ~20:00 UTC window closes + buffer
 ARCHIVE_DEPTH = 14
 
@@ -113,12 +113,8 @@ def _evaluate(blend: ServingBlend, X_std, y_std, pooled_sets) -> Dict:
     out["livesize"] = {"reward": float(np.mean(live_rewards)), "seeds": live_rewards}
 
     Xp0, yp0 = pooled_sets[0]
-    p0 = blend.score_prob(Xp0)
-    thr = fit_deploy_threshold(p0[yp0 == 0], target_fpr=TARGET_FPR)
-    out["deploy_threshold"] = thr
-    shaped = shape_hybrid(
-        blend.score_rank(Xp0), p0, deploy_threshold=thr, max_pos_frac=MAX_POS_FRAC
-    )
+    # evaluate the SAME gate-safe shaping we serve (fixed top-k%, no threshold)
+    shaped = shape_gate_safe(blend.score_rank(Xp0), pos_frac=MAX_POS_FRAC)
     sys.path.insert(0, "/root/Skip/poker/SN126/00_external/owner_repo")
     from poker44.score.scoring import reward as official  # noqa: PLC0415
 
@@ -155,7 +151,7 @@ def run_cycle(*, dry_run: bool = False, skip_fetch: bool = False) -> Dict:
     # v4/H1: no cross-player pooling augmentation (it mixes multiple policies into
     # one chunk and corrupts the single-policy signature signal). Size-robustness
     # comes from the order-stat/entropy features + hand_count instead.
-    tr_d, tr_rows, tr_y = featurize_dates(train_dates, augment=False, refresh=False)
+    tr_d, tr_rows, tr_y = featurize_dates(train_dates, augment=False, full_ring=True, refresh=False)
     te_d, te_rows, te_y = featurize_dates(holdout, augment=False, refresh=False)
     real_rows = featurize_real_captures(refresh=False)
     Xtr_all = rows_to_matrix(tr_rows, cols)
@@ -239,11 +235,6 @@ def run_cycle(*, dry_run: bool = False, skip_fetch: bool = False) -> Dict:
         y_all = np.concatenate([ytr, yte])
         d_all = list(tr_d) + list(te_d)
         final = ServingBlend(_fit_members(X_all, y_all, d_all))
-        # deploy threshold on the freshest pooled set with the final model
-        Xp0, yp0 = pooled_sets[0]
-        p0 = final.score_prob(Xp0)
-        deploy_threshold = fit_deploy_threshold(p0[yp0 == 0], target_fpr=TARGET_FPR)
-
         ARCHIVE.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         if SERVING.exists():
@@ -259,8 +250,7 @@ def run_cycle(*, dry_run: bool = False, skip_fetch: bool = False) -> Dict:
             "final_train_span": [dates[0], dates[-1]],
             "gate_train_span": summary["train_span"],
             "gate_holdout": holdout,
-            "deploy_threshold": deploy_threshold,
-            "max_pos_frac": MAX_POS_FRAC,
+            "pos_frac": MAX_POS_FRAC,
             "gate_metrics": cand,
         }
         SERVING.with_name(SERVING.stem + "_meta.json").write_text(json.dumps(meta, indent=2))

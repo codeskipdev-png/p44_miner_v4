@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 from sklearn.metrics import average_precision_score
 
-from .dataset import BENCH_DIR, available_dates, iter_batches, live_size_augment
+from .dataset import BENCH_DIR, available_dates, iter_batches, live_size_augment, full_ring_variant
 from .features import chunk_features, feature_names, rows_to_matrix
 
 
@@ -74,13 +74,15 @@ def _featurize_one(args: Tuple[str, List[dict], int]) -> Tuple[str, Dict[str, fl
     return date, chunk_features(hands), label
 
 
-def featurize_dates(dates: List[str], *, augment: bool, refresh: bool) -> Tuple[List[str], List[Dict], List[int]]:
+def featurize_dates(
+    dates: List[str], *, augment: bool, refresh: bool, full_ring: bool = False
+) -> Tuple[List[str], List[Dict], List[int]]:
     CACHE.mkdir(parents=True, exist_ok=True)
     all_dates: List[str] = []
     all_rows: List[Dict] = []
     all_labels: List[int] = []
     for date in dates:
-        tag = ("aug" if augment else "base") + "_" + CACHE_VERSION
+        tag = ("aug" if augment else "base") + ("_fr" if full_ring else "") + "_" + CACHE_VERSION
         cache_file = CACHE / f"{date}_{tag}_{_bench_sig(date)}.pkl"
         if cache_file.exists() and not refresh:
             with cache_file.open("rb") as f:
@@ -89,6 +91,11 @@ def featurize_dates(dates: List[str], *, augment: bool, refresh: bool) -> Tuple[
             batches = list(iter_batches([date]))
             if augment:
                 batches = batches + live_size_augment(batches)
+            if full_ring:  # v4 edge: add synthetic 7-9-max views of each batch
+                batches = batches + [
+                    (d, full_ring_variant(h, seed=i), l)
+                    for i, (d, h, l) in enumerate(batches)
+                ]
             with ProcessPoolExecutor(max_workers=10) as ex:
                 results = list(ex.map(_featurize_one, batches, chunksize=8))
             rows = [r for _, r, _ in results]

@@ -5,14 +5,15 @@ Contract (one violation = the whole evaluation window scores zero):
   2. Never raise, whatever the payload looks like.
   3. Stay far inside the validator's 180s timeout.
 
-Scoring path: features -> ServingBlend (v1 + live-var + ks0.90) ->
-hybrid shaping: ordering from in-request rank fusion (the validator's scoring
-window is exactly one request's chunks), positive count from the calibrated
-probability blend vs the deploy threshold.
+Scoring path: features -> ServingBlend -> in-request rank fusion ->
+gate-safe shaping (flag the top P44_POS_FRAC of chunks by rank, guaranteed >=1,
+rank-preserving). See pipeline/threshold.shape_gate_safe for why a fixed
+fraction (not a probability threshold) is the correct gate strategy.
 """
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 import time
 import warnings
@@ -27,7 +28,7 @@ import numpy as np
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 from pipeline.features import chunk_features
-from pipeline.threshold import shape_hybrid
+from pipeline.threshold import shape_gate_safe
 
 log = logging.getLogger("scorer")
 
@@ -41,12 +42,14 @@ class ChunkScorer:
         self,
         model_path: Path | str = ARTIFACTS / "serving_blend_v4.pkl",
         *,
-        deploy_threshold: float | None = None,
-        max_pos_frac: float = 0.16,
+        pos_frac: float | None = None,
     ):
         self.model_path = Path(model_path)
-        self.max_pos_frac = float(max_pos_frac)
-        self._fixed_threshold = deploy_threshold
+        # gate budget: fraction of chunks flagged >=0.5 per request (env-tunable
+        # per miner so v3/v4 can run different gate widths in the live A/B).
+        self.pos_frac = float(
+            pos_frac if pos_frac is not None else os.getenv("P44_POS_FRAC", "0.16")
+        )
         self._mtime = 0.0
         self._load()
 
@@ -54,18 +57,10 @@ class ChunkScorer:
         with self.model_path.open("rb") as f:
             self.blend = pickle.load(f)
         self._mtime = self.model_path.stat().st_mtime
-        meta_path = self.model_path.with_name(self.model_path.stem + "_meta.json")
-        self.deploy_threshold = self._fixed_threshold
-        if self.deploy_threshold is None and meta_path.exists():
-            import json
-
-            meta = json.loads(meta_path.read_text())
-            self.deploy_threshold = float(meta.get("deploy_threshold", 0.5))
-        self.deploy_threshold = float(self.deploy_threshold or 0.5)
         log.info(
-            "model loaded (mtime=%s, deploy_threshold=%.4f)",
+            "model loaded (mtime=%s, pos_frac=%.3f)",
             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._mtime)),
-            self.deploy_threshold,
+            self.pos_frac,
         )
 
     def _maybe_reload(self) -> None:
@@ -102,11 +97,8 @@ class ChunkScorer:
         if rows:
             try:
                 X = self.blend.featurize(rows)
-                shaped = shape_hybrid(
-                    self.blend.score_rank(X),
-                    self.blend.score_prob(X),
-                    deploy_threshold=self.deploy_threshold,
-                    max_pos_frac=self.max_pos_frac,
+                shaped = shape_gate_safe(
+                    self.blend.score_rank(X), pos_frac=self.pos_frac
                 )
                 for j, i in enumerate(usable_idx):
                     scores[i] = shaped[j]

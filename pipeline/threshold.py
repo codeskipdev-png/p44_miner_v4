@@ -11,6 +11,35 @@ from __future__ import annotations
 import numpy as np
 
 
+def shape_gate_safe(rank_scores: np.ndarray, *, pos_frac: float = 0.16) -> np.ndarray:
+    """Gate-safe shaping: flag exactly the top `pos_frac` of chunks (by rank) as
+    positive (just above 0.5), the rest below 0.5, preserving rank order.
+
+    Why a FIXED fraction (not a probability threshold): the reward's AP and
+    recall@FPR are rank metrics, unaffected by where scores sit; only the 0.5
+    crossing matters, via the human-safety gate. That gate is 0 (whole reward 0)
+    if NONE of the >=0.5 chunks is a real bot (`true_positives == 0`), and decays
+    only once human FPR@0.5 > 10%. The failure that zeroed v4 was true_positives=0
+    (top-k caught no bot), so k must be large enough to reliably include a bot;
+    tying k to a live-shifted probability threshold is exactly what made it
+    unpredictable. Fixing k = round(n * pos_frac) and guaranteeing k >= 1 removes
+    the catastrophic-0 risk; pos_frac trades bot-coverage against FPR.
+    """
+    r = np.asarray(rank_scores, dtype=float)
+    n = len(r)
+    if n == 0:
+        return r
+    k = int(max(1, min(n, round(n * pos_frac))))
+    order = np.argsort(-r, kind="mergesort")  # rank position 0 = most bot-like
+    out = np.empty(n, dtype=float)
+    for pos, i in enumerate(order):
+        if pos < k:  # positives -> (0.5, 0.6], rank-preserving
+            out[i] = 0.501 + 0.098 * (k - 1 - pos) / max(k - 1, 1)
+        else:        # negatives -> [0, 0.5), rank-preserving
+            out[i] = 0.499 * (n - 1 - pos) / max(n - 1 - k, 1)
+    return out
+
+
 def fit_deploy_threshold(
     human_scores: np.ndarray,
     *,

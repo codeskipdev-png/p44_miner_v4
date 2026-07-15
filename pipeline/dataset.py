@@ -6,6 +6,7 @@ indistinguishable from a live request (train == serve).
 """
 from __future__ import annotations
 
+import copy
 import json
 import random
 from pathlib import Path
@@ -76,4 +77,47 @@ def live_size_augment(
             continue
         rng.shuffle(picked)
         out.append((date, picked[:target], label))
+    return out
+
+
+def full_ring_variant(hands: List[dict], seed: int) -> List[dict]:
+    """Re-cast a 6-max chunk as a 7-9-max chunk: bump max_seats and re-alias the
+    used seats onto a spread of the larger ring, preserving each hand's action
+    dynamics and which player is the hero.
+
+    The benchmark is 6-max ONLY, so max_seats/occupancy are constant in training
+    and the model cannot learn the seat-count axis — yet 41% of LIVE traffic is
+    7-9-max, where every miner (including the leaders) extrapolates. These
+    synthetic views expose the model to varied seat counts so its ranking
+    degrades less on full-ring live chunks. (It cannot fabricate extra players'
+    play, so it teaches seat-count invariance, not new full-ring dynamics.)
+    """
+    rng = random.Random(seed)
+    target = rng.choice([7, 8, 9])
+    out: List[dict] = []
+    for h in hands:
+        h2 = copy.deepcopy(h)
+        meta = h2.get("metadata") or {}
+        meta["max_seats"] = target
+        used = sorted(
+            {int(a.get("actor_seat") or 0) for a in (h2.get("actions") or [])}
+            | {int(p.get("seat") or 0) for p in (h2.get("players") or [])}
+            | {int(meta.get("hero_seat") or 0)}
+        )
+        used = [s for s in used if s > 0]
+        if used and len(used) <= target:
+            remap = dict(zip(used, sorted(rng.sample(range(1, target + 1), len(used)))))
+            for a in h2.get("actions") or []:
+                s = int(a.get("actor_seat") or 0)
+                if s in remap:
+                    a["actor_seat"] = remap[s]
+            for p in h2.get("players") or []:
+                s = int(p.get("seat") or 0)
+                if s in remap:
+                    p["seat"] = remap[s]
+            hs = int(meta.get("hero_seat") or 0)
+            if hs in remap:
+                meta["hero_seat"] = remap[hs]
+        h2["metadata"] = meta
+        out.append(h2)
     return out
