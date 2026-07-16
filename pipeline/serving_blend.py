@@ -17,14 +17,37 @@ from .features import feature_names, rows_to_matrix
 
 
 class ServingBlend:
-    def __init__(self, members: List[Tuple[str, object]]):
-        self.members = members  # [(tag, RankBlend)]
+    def __init__(self, members: List[Tuple[str, object]], weights: Dict[str, float] | None = None):
+        self.members = members  # [(tag, RankBlend|PercentileBlend)]
         self.all_cols = feature_names()
         self._col_idx = {
             tag: [self.all_cols.index(c) for c in blend.cols]
             for tag, blend in members
         }
+        # M2: per-member fusion weights (reward-aligned selection sets these; default
+        # equal == the historical behaviour). Normalized and defensive to missing tags.
+        self.weights = self._norm_weights(weights)
         self.meta: Dict = {}
+
+    def _norm_weights(self, weights: Dict[str, float] | None) -> Dict[str, float]:
+        tags = [t for t, _ in self.members]
+        if not weights:
+            return {t: 1.0 / len(tags) for t in tags}
+        w = {t: max(float(weights.get(t, 0.0)), 0.0) for t in tags}
+        s = sum(w.values())
+        return {t: (w[t] / s if s > 0 else 1.0 / len(tags)) for t in tags}
+
+    def _wt(self) -> Dict[str, float]:
+        """Backward-compatible weight accessor: models pickled before M2 have no
+        `weights` attribute -> fall back to equal, reproducing the old sum/len fusion
+        exactly. Prevents a crash when the new code loads an old champion artifact."""
+        w = getattr(self, "weights", None)
+        if not w:
+            return {t: 1.0 / len(self.members) for t, _ in self.members}
+        return w
+
+    def set_weights(self, weights: Dict[str, float]) -> None:
+        self.weights = self._norm_weights(weights)
 
     @staticmethod
     def _rank01(p: np.ndarray) -> np.ndarray:
@@ -39,12 +62,14 @@ class ServingBlend:
         }
 
     def score_prob(self, X_all: np.ndarray) -> np.ndarray:
+        w = self._wt()
         probs = self.member_probs(X_all)
-        return sum(probs.values()) / len(probs)
+        return sum(w[t] * p for t, p in probs.items())
 
     def score_rank(self, X_all: np.ndarray) -> np.ndarray:
+        w = self._wt()
         probs = self.member_probs(X_all)
-        return sum(self._rank01(p) for p in probs.values()) / len(probs)
+        return sum(w[t] * self._rank01(p) for t, p in probs.items())
 
     def featurize(self, rows: List[Dict[str, float]]) -> np.ndarray:
         return rows_to_matrix(rows, self.all_cols)

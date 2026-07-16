@@ -152,3 +152,63 @@ class RankBlend:
         probs = self.member_probs(X)
         w = self.WEIGHTS
         return sum(w[k] * p for k, p in probs.items()) / sum(w.values())
+
+
+def _percentile_within(X: np.ndarray) -> np.ndarray:
+    """Map each column to its within-batch percentile in [0,1] (ties -> distinct
+    ranks via stable sort). This is the whole M1 trick: a per-batch monotone
+    transform makes every feature's marginal uniform inside the scoring batch, so
+    the model NEVER sees a raw magnitude and is invariant to any monotone marginal
+    shift between benchmark and live (our measured domain-AUC=1.0 disjoint support)."""
+    X = np.asarray(X, dtype=float)
+    n = len(X)
+    if n <= 1:
+        return np.full_like(X, 0.5, dtype=float)
+    return np.argsort(np.argsort(X, axis=0, kind="mergesort"), axis=0) / (n - 1)
+
+
+def _percentile_grouped(X: np.ndarray, groups) -> np.ndarray:
+    """Percentile-transform WITHIN each group (a training date). At serve time the
+    'group' is the whole request, handled by _percentile_within directly."""
+    out = np.empty_like(X, dtype=float)
+    g = np.asarray(groups)
+    for val in np.unique(g):
+        m = g == val
+        out[m] = _percentile_within(X[m])
+    return out
+
+
+class PercentileBlend(RankBlend):
+    """M1: a RankBlend that operates on within-batch PERCENTILE-transformed features.
+
+    Same members and fusion as RankBlend, but every feature is replaced by its
+    percentile inside the scoring batch (grouped by date at fit, by request at serve)
+    BEFORE the members see it. uid176 (rank-1) does exactly this via
+    grouped_percentile_feature_matrix (model.py:80,106); it is the frontier's core
+    train/serve-skew defense. Interface is identical to RankBlend (.cols/.fit/
+    .score/.score_prob) so ServingBlend treats it as a drop-in member.
+
+    NOTE the transform is applied at fit AND at every predict, so the model is trained
+    and served on the same uniform-marginal representation (train==serve preserved).
+    """
+
+    def fit(self, X: np.ndarray, y: np.ndarray, dates: List[str], cols: List[str]):
+        self.cols = list(cols)
+        Xp = _percentile_grouped(X, dates)
+        signs = mine_monotone_signs(Xp, y, dates)
+        self.meta["n_monotone"] = int(np.count_nonzero(signs))
+        self.meta["percentile"] = True
+        self.stack = build_stack().fit(Xp, y)
+        self.mono = build_mono(signs).fit(Xp, y)
+        self.mlp = build_mlp().fit(Xp, y)
+        return self
+
+    def member_probs(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+        # X here is one scoring batch (a request at serve, a date-slice offline);
+        # percentile-transform within it, then predict on the uniform representation.
+        Xp = _percentile_within(X)
+        return {
+            "stack": self.stack.predict_proba(Xp)[:, 1],
+            "mono": self.mono.predict_proba(Xp)[:, 1],
+            "mlp": self.mlp.predict_proba(Xp)[:, 1],
+        }

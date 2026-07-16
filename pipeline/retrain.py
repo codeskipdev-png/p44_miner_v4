@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore", message="X does not have valid feature names")
 from .dataset import available_dates, iter_batches
 from .features import chunk_features, feature_names, rows_to_matrix
 from .fetch_benchmark import sync
-from .model import RankBlend
+from .model import PercentileBlend, RankBlend
 from .serving_blend import ServingBlend
 from .threshold import shape_gate_safe
 from .train import (
@@ -59,11 +59,27 @@ MAX_POS_FRAC = 0.20
 RETRAIN_UTC_HOUR = 3.5  # 03:30 UTC, after the ~20:00 UTC window closes + buffer
 ARCHIVE_DEPTH = 14
 
+# v4-frontier: ALL-PERCENTILE ensemble (M1). Within-batch percentile-transformed
+# inputs -> invariant to the benchmark->live marginal shift (uid176's core defense).
+# Three feature views for decorrelation, all percentile-transformed.
+#
+# MEASURED 2026-07-16 (decisive): on the 8 live captures, this all-percentile blend
+# restores live score spread to 0.651 (healthy ref 0.608; our raw v4 had collapsed to
+# 0.22) AND lifts recall@5%FPR from ~0.76 to ~0.95, human_safety=1.0. RAW members are
+# deliberately EXCLUDED: they saturate on the sanitized live feed and DRAG spread down
+# (equal-weight 4-member = 0.41, all-raw = 0.25) -- the exact collapse M1 fixes.
 MEMBER_SPECS = [
-    ("v1", "all"),          # every feature (in-distribution sharp)
-    ("live-var", "livevar"),  # drop live-constant features
-    ("ks0.90", "ks"),       # drop KS>0.90 features
+    ("pct-all", "all", "pct"),          # every feature, percentile-invariant
+    ("pct-livevar", "livevar", "pct"),  # live-varying features, percentile-invariant
 ]
+
+# M2 (select_weights) is DISABLED for v4: its objective is the offline official reward,
+# which our data proves is a "live mirage" -- given the free choice it put ALL weight on
+# the raw in-distribution member and ZEROED the percentile branches, collapsing live
+# spread 0.22->0.13. Reward-aligned selection on an anti-predictive offline metric
+# selects AGAINST live discrimination. Members are equal-weighted; live rounds decide.
+# (select_weights is kept in the module for reference / a future spread-aware objective.)
+USE_M2_WEIGHTS = False
 
 
 def log(msg: str) -> None:
@@ -124,6 +140,64 @@ def _evaluate(blend: ServingBlend, X_std, y_std, pooled_sets) -> Dict:
     return out
 
 
+def select_weights(blend: ServingBlend, pooled_sets, *, n_samples: int = 300) -> Tuple[Dict[str, float], Dict]:
+    """M2: pick per-member fusion weights by REWARD, not equal average.
+
+    For each candidate weight vector we shape the fused rank exactly as served and
+    score it with the REAL validator reward on every pooled live-size window, then
+    rank candidates by a VARIANCE-PENALIZED objective (mean - 0.5*std), matching the
+    frontier's robust selection (uid176 train.py:304). This deliberately does NOT
+    optimize benchmark AP -- our own data shows offline AP is a 'live mirage'.
+    Selection runs on the held-out pooled windows (members were fit train-only), so
+    the weights are chosen out-of-sample w.r.t. the members.
+
+    Returns (weights, info). Weights are applied to BOTH the gate candidate and the
+    all-dates final refit, so the recipe validated on holdout is what ships.
+    """
+    sys.path.insert(0, "/root/Skip/poker/SN126/00_external/owner_repo")
+    from poker44.score.scoring import reward as official  # noqa: PLC0415
+
+    tags = [t for t, _ in blend.members]
+    # precompute per-window, per-member rank01 vectors once (weights only re-mix them)
+    windows = []
+    for Xp, yp in pooled_sets:
+        mp = blend.member_probs(Xp)
+        windows.append(({t: ServingBlend._rank01(mp[t]) for t in tags}, yp))
+
+    def objective(w: Dict[str, float]) -> Tuple[float, List[float]]:
+        rewards = []
+        for ranks, yp in windows:
+            fused = sum(w[t] * ranks[t] for t in tags)
+            shaped = shape_gate_safe(fused, pos_frac=MAX_POS_FRAC)
+            r, res = official(shaped, yp)
+            # never select a weight vector that trips the human-safety gate
+            rewards.append(r if res["human_safety_penalty"] >= 1.0 else 0.0)
+        arr = np.asarray(rewards)
+        return float(arr.mean() - 0.5 * arr.std()), rewards
+
+    cands: List[Dict[str, float]] = [{t: 1.0 / len(tags) for t in tags}]  # equal
+    for t in tags:  # each member solo
+        cands.append({s: (1.0 if s == t else 0.0) for s in tags})
+    rng = np.random.RandomState(0)
+    for _ in range(n_samples):  # Dirichlet simplex samples
+        v = rng.dirichlet(np.ones(len(tags)))
+        cands.append({t: float(v[i]) for i, t in enumerate(tags)})
+
+    equal_val, best_rewards = objective(cands[0])
+    best_w, best_obj_val = cands[0], equal_val
+    for w in cands[1:]:
+        val, rewards = objective(w)
+        if val > best_obj_val:
+            best_obj_val, best_rewards, best_w = val, rewards, w
+    info = {
+        "weights": {t: round(best_w[t], 4) for t in tags},
+        "objective": round(best_obj_val, 4),
+        "equal_objective": round(equal_val, 4),
+        "per_window_reward": [round(r, 4) for r in best_rewards],
+    }
+    return best_w, info
+
+
 def run_cycle(*, dry_run: bool = False, skip_fetch: bool = False) -> Dict:
     summary: Dict = {"started_at": dt.datetime.utcnow().isoformat() + "Z"}
 
@@ -170,17 +244,27 @@ def run_cycle(*, dry_run: bool = False, skip_fetch: bool = False) -> Dict:
 
     def _fit_members(X, y, dates):
         out = []
-        for tag, spec in MEMBER_SPECS:
+        for tag, spec, kind in MEMBER_SPECS:
             kept = _member_cols(spec, X, Xreal_all, cols)
             idx = [cols.index(c) for c in kept]
             t0 = time.time()
-            blend = RankBlend().fit(X[:, idx], y, dates, kept)
+            cls = PercentileBlend if kind == "pct" else RankBlend
+            blend = cls().fit(X[:, idx], y, dates, kept)
             out.append((tag, blend))
-            log(f"  member {tag}: {len(kept)} features, {time.time()-t0:.0f}s")
+            log(f"  member {tag} [{kind}]: {len(kept)} features, {time.time()-t0:.0f}s")
         return out
 
     log("training gate candidate (train dates only)...")
     candidate = ServingBlend(_fit_members(Xtr_all, ytr, tr_d))
+    if USE_M2_WEIGHTS:
+        # M2: reward-aligned, variance-penalized fusion weights (on held-out windows).
+        sel_weights, sel_info = select_weights(candidate, pooled_sets)
+        candidate.set_weights(sel_weights)
+        log(f"M2 weights: {sel_info['weights']} | obj {sel_info['objective']} vs equal {sel_info['equal_objective']}")
+        summary["m2_selection"] = sel_info
+    else:
+        sel_weights = None  # equal weighting; see MEMBER_SPECS note on why M2 is off
+        log("M2 disabled (offline-reward objective is anti-predictive here); equal weights")
     cand = _evaluate(candidate, Xte_all, yte, pooled_sets)
     log(
         f"candidate: standard {cand['standard']['reward']:.4f} "
@@ -234,7 +318,8 @@ def run_cycle(*, dry_run: bool = False, skip_fetch: bool = False) -> Dict:
         X_all = np.vstack([Xtr_all, Xte_all])
         y_all = np.concatenate([ytr, yte])
         d_all = list(tr_d) + list(te_d)
-        final = ServingBlend(_fit_members(X_all, y_all, d_all))
+        # ship the SAME recipe validated on holdout: same members + the M2 weights.
+        final = ServingBlend(_fit_members(X_all, y_all, d_all), weights=sel_weights)
         ARCHIVE.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         if SERVING.exists():
